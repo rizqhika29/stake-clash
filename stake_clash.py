@@ -15,30 +15,44 @@ Security Model
 1. **Caller restriction**: Only the creator or opponent can resolve before
    the timeout. After the timeout, anyone can trigger resolution (or
    force-refund if no consensus is reached).
-2. **Anti double-fund**: The opponent can only fund once; the contract
+2. **Exact escrow before FUNDED**: A bet can only enter the 'funded' state
+   when BOTH exact stakes are actually escrowed. create_bet accounts for
+   any value it receives (0 => fund later, exact stake => escrowed now,
+   anything else => rejected). accept_and_fund_bet refuses to transition
+   until the creator's stake is escrowed.
+3. **Anti double-fund**: The opponent can only fund once; the contract
    rejects duplicate funding attempts.
-3. **Per-bet fund isolation**: Each bet has its own stake pool. Payouts
+4. **Per-bet fund isolation**: Each bet has its own stake pool. Payouts
    come from the bet's own funds, not a shared pool.
-4. **Timeout / escape path**: After RESOLUTION_TIMEOUT (7 days) from
-   funding, if no resolution has occurred, anyone can call resolve_bet.
-   If consensus is reached, winner is paid. If not, both parties get
-   refunded.
-5. **Atomic state + transfer**: State updates and token transfers happen
+5. **Event-finality gate**: Resolution can only reach a terminal outcome
+   when the event is FINAL. An unfinished or unclear event returns a
+   retryable 'not_final' status and can never trigger an immediate
+   terminal draw refund.
+6. **Deterministic timeout refund**: timeout_refund() is a fully
+   deterministic path (no LLM / web / nondeterministic consensus) that
+   refunds both parties once the resolution timeout expires.
+7. **Atomic state + transfer**: State updates and token transfers happen
    in the same transaction.
-6. **Validator binding**: Validators independently re-fetch the same URL
+8. **Validator binding**: Validators independently re-fetch the same URL
    and verify the same outcome. The equivalence check requires agreement
-   on the winner.
-7. **URL binding**: The resolution_url is locked at creation and cannot
+   on the winner AND on event finality.
+9. **URL binding**: The resolution_url is locked at creation and cannot
    be changed. Validators verify against the stored URL.
-8. **Cancel protection**: Only the creator can cancel, and only before
-   the opponent has funded.
+10. **Cancel protection**: Only the creator can cancel, and only before
+    the opponent has funded.
 
 Lifecycle
 ---------
-1. Creator calls create_bet() -> bet_id (status: open)
-2. Opponent calls accept_and_fund_bet(bet_id) + sends exact stake -> (status: funded)
-3. Anyone (with restrictions) calls resolve_bet(bet_id) -> AI consensus -> winner
+1. Creator calls create_bet() -> bet_id (status: open; creator stake
+   escrowed if value == stake, otherwise fund_creator_stake() must be
+   called before the opponent can accept)
+2. Opponent calls accept_and_fund_bet(bet_id) + sends exact stake ->
+   (status: funded; only allowed once the creator's stake is escrowed)
+3. Anyone (with restrictions) calls resolve_bet(bet_id) -> AI consensus
+   -> event-finality check -> winner (or retryable 'not_final')
 4. Winner receives 2x stake (their own + opponent's)
+5. After RESOLUTION_TIMEOUT, anyone can call timeout_refund() for a
+   deterministic refund regardless of consensus
 
 Trust Model
 -----------
@@ -293,9 +307,12 @@ class StakeClash(gl.Contract):
     ) -> str:
         """Create a new head-to-head bet against the specified opponent.
 
-        The caller becomes the creator. The creator defines the event
-        description, resolution URL, criteria, and stake amount.
-        The opponent must then accept and fund the bet.
+        ESCROW ACCOUNTING: Any value carried by this transaction is
+        accounted for. Sending exactly `stake` escrows the creator's stake
+        immediately (creator_funded = True); sending 0 leaves the creator
+        unfunded so fund_creator_stake() must be called later; any other
+        value is rejected. This guarantees the contract never silently
+        absorbs unaccounted value.
 
         Returns the new bet_id."""
         opponent = _coerce_address(opponent)
@@ -306,6 +323,16 @@ class StakeClash(gl.Contract):
         creator = gl.message.sender_address
         if str(creator) == str(opponent):
             raise gl.vm.UserError("creator and opponent must be different")
+
+        # ESCROW: account for value sent to create_bet. 0 => fund later,
+        # exactly the stake => escrowed now, anything else => reject.
+        sent = int(gl.message.value)
+        if sent != 0 and sent != stake:
+            raise gl.vm.UserError(
+                f"create_bet value must be 0 or exactly the stake ({stake}), "
+                f"sent {sent}"
+            )
+        creator_funded = sent == stake
 
         bet_id = f"bet-{self.bet_count}"
         self.bet_count = self.bet_count + u256(1)
@@ -319,7 +346,7 @@ class StakeClash(gl.Contract):
             resolution_criteria=resolution_criteria,
             creator_stake=u256(stake),
             opponent_stake=u256(0),
-            creator_funded=False,
+            creator_funded=creator_funded,
             opponent_funded=False,
             status=BET_STATUS_OPEN,
             winner=Address(b"\x00" * 20),
@@ -360,9 +387,10 @@ class StakeClash(gl.Contract):
     def accept_and_fund_bet(self, bet_id: str) -> str:
         """Opponent accepts the bet and funds their stake.
 
-        The transaction must carry exactly the creator_stake amount
-        (matched stake). This transitions the bet from 'open' to 'funded'
-        and starts the resolution timeout.
+        ESCROW INVARIANT: This can only transition the bet to 'funded'
+        when BOTH exact stakes are escrowed -- the creator's stake must
+        already be escrowed (via create_bet value or fund_creator_stake)
+        and the transaction must carry the opponent's exact matched stake.
 
         SECURITY: Only the designated opponent can call this. Anti double-fund
         is enforced by checking opponent_funded status.
@@ -378,6 +406,10 @@ class StakeClash(gl.Contract):
             raise gl.vm.UserError("bet is not in open status")
         if bet.opponent_funded:
             raise gl.vm.UserError("opponent already funded (double-fund rejected)")
+        if not bet.creator_funded:
+            raise gl.vm.UserError(
+                "creator stake not escrowed: creator must fund first"
+            )
         if gl.message.value != bet.creator_stake:
             raise gl.vm.UserError(
                 f"stake mismatch: expected {int(bet.creator_stake)}, "
@@ -421,6 +453,49 @@ class StakeClash(gl.Contract):
         return "Bet cancelled, creator refunded"
 
     @gl.public.write
+    def timeout_refund(self, bet_id: str) -> dict:
+        """DETERMINISTIC timeout refund path.
+
+        Refunds both parties once RESOLUTION_TIMEOUT has elapsed since the
+        bet was funded. This method never enters a nondeterministic block
+        (no LLM, no web fetch, no consensus required), so it can always
+        commit. Anyone may call it.
+
+        Returns refund dict."""
+        bet_id = str(bet_id)
+        bet = self._get_bet(bet_id)
+
+        if bet.status == BET_STATUS_REFUNDED:
+            return {"status": "already_refunded", "result": bet.result}
+        if bet.status == BET_STATUS_RESOLVED:
+            return {
+                "status": "already_resolved",
+                "winner": str(bet.winner),
+                "result": bet.result,
+            }
+        if bet.status == BET_STATUS_CANCELLED:
+            return {"status": "already_cancelled", "result": bet.result}
+        if bet.status != BET_STATUS_FUNDED:
+            raise gl.vm.UserError(
+                f"cannot timeout-refund bet in '{bet.status}' status"
+            )
+
+        if not self._is_timeout_expired(bet):
+            raise gl.vm.UserError(
+                "timeout not expired: refund available only after the "
+                "resolution timeout"
+            )
+
+        # Fully deterministic refund: no nondeterministic operations here.
+        self._refund_bet(bet_id, bet)
+        return {
+            "status": "refunded",
+            "result": "timeout_refund",
+            "winner": "",
+            "payout": 0,
+        }
+
+    @gl.public.write
     def resolve_bet(self, bet_id: str) -> dict:
         """Resolve a bet using AI-powered validator consensus.
 
@@ -431,8 +506,14 @@ class StakeClash(gl.Contract):
           the winner based on the resolution_criteria
         - Validators independently re-fetch and verify the same URL
 
+        EVENT-FINALITY GATE: a terminal outcome is only possible when the
+        consensus reports the event as final. An unfinished or unclear
+        event returns a retryable 'not_final' status (or the timeout refund
+        after the timeout) and can never produce an immediate terminal
+        draw refund.
+
         If timeout has passed and consensus cannot be reached, the bet
-        is refunded to both parties.
+        can also be refunded deterministically via timeout_refund().
 
         Returns resolution dict: {status, winner, result, payout}."""
         bet_id = str(bet_id)
@@ -498,6 +579,27 @@ class StakeClash(gl.Contract):
         # Extract winner from consensus
         values = result["values"]
         winner_label = values.get("winner", "DRAW")
+        event_final = bool(values.get("event_final", False))
+
+        # EVENT-FINALITY GATE: an unfinished or unclear event can never
+        # reach a terminal draw refund. It either retries (before timeout)
+        # or falls back to the timeout refund path (after timeout).
+        if not event_final:
+            if timeout_expired:
+                self._refund_bet(bet_id, bet)
+                return {
+                    "status": "refunded",
+                    "result": "timeout_event_not_final",
+                    "winner": "",
+                    "payout": 0,
+                }
+            return {
+                "status": "not_final",
+                "result": "event_not_final_or_unclear",
+                "winner": "",
+                "payout": 0,
+                "retryable": True,
+            }
 
         if winner_label == "CREATOR_WIN":
             winner = creator
@@ -506,7 +608,7 @@ class StakeClash(gl.Contract):
             winner = opponent
             loser = creator
         else:
-            # DRAW - refund both
+            # Event is FINAL and the outcome is a genuine draw -> refund both.
             self._refund_bet(bet_id, bet)
             return {
                 "status": "draw_refunded",
@@ -536,6 +638,7 @@ class StakeClash(gl.Contract):
             "winner_label": winner_label,
             "result": bet.result,
             "payout": int(payout),
+            "event_final": True,
             "confidence": values.get("confidence", 0),
             "reasoning": values.get("reasoning", ""),
         }
@@ -622,14 +725,22 @@ Source content:
 Based ONLY on the content of this source, determine the outcome of this bet.
 - If the creator's position is correct, respond with CREATOR_WIN
 - If the opponent's position is correct, respond with OPPONENT_WIN
-- If it's a draw or unclear, respond with DRAW
+- If it is a genuine final draw, respond with DRAW
+
+CRITICAL - event finality:
+- Set "event_final" to true ONLY if the event has CONCLUDED and this source
+  CLEARLY shows the final outcome.
+- If the event is still ongoing, unfinished, or the source is unclear or
+  ambiguous about the final result, set "event_final" to false.
+- When event_final is false, set winner to "DRAW" as a placeholder.
 
 You MUST also provide:
+- event_final: true or false (see above)
 - confidence: a number 0-100 indicating your confidence
 - reasoning: a brief explanation of your determination
 
 Respond with ONLY a JSON object, no other text, no markdown fences:
-{{"winner": "CREATOR_WIN" or "OPPONENT_WIN" or "DRAW", "confidence": <0-100>, "reasoning": "<1-2 sentences>"}}"""
+{{"winner": "CREATOR_WIN" or "OPPONENT_WIN" or "DRAW", "event_final": true or false, "confidence": <0-100>, "reasoning": "<1-2 sentences>"}}"""
 
     try:
         parsed = gl.nondet.exec_prompt(prompt, response_format="json")
@@ -641,16 +752,21 @@ Respond with ONLY a JSON object, no other text, no markdown fences:
         return {"ok": False, "reason": "invalid_llm_response"}
 
     winner = _normalize_verdict(payload.get("winner"))
+    event_final = bool(payload.get("event_final", False))
     confidence = payload.get("confidence", 0)
     reasoning = str(payload.get("reasoning", ""))[:500]
 
     if winner is None:
-        return {"ok": False, "reason": "unverdictable"}
+        # An invalid winner with event_final=false still signals "not final".
+        if event_final:
+            return {"ok": False, "reason": "unverdictable"}
+        winner = "DRAW"
 
     return {
         "ok": True,
         "values": {
             "winner": winner,
+            "event_final": event_final,
             "confidence": confidence,
             "reasoning": reasoning,
         },
@@ -693,6 +809,10 @@ def _consensus_validator(
     leader_values = leader_data.get("values", {})
     my_values = my_data.get("values", {})
 
+    # Validators must agree on event finality (resolution-opening condition)
+    if leader_values.get("event_final") != my_values.get("event_final"):
+        return False
+
     # Critical: winner must match exactly
     leader_winner = leader_values.get("winner")
     my_winner = my_values.get("winner")
@@ -710,7 +830,10 @@ def _consensus_validator(
 
 
 def _consensus_ok(data) -> bool:
-    """Deterministic shape check on the agreed consensus payload."""
+    """Deterministic shape check on the agreed consensus payload.
+
+    Requires the event_finality flag to be present (its value is a semantic
+    decision handled by resolve_bet, but the field must exist)."""
     payload = _parse_json_object(data)
     if payload is None:
         return False
@@ -718,6 +841,8 @@ def _consensus_ok(data) -> bool:
         return False
     values = payload.get("values")
     if not isinstance(values, dict):
+        return False
+    if not isinstance(values.get("event_final"), bool):
         return False
     winner = _normalize_verdict(values.get("winner"))
     if winner is None:
