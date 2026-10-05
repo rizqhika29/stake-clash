@@ -4,8 +4,8 @@ P2P head-to-head sports betting contract on GenLayer. Two users challenge each o
 
 ## Deployed Contract
 
-**Address:** `0x7c557cc043d7F8e338A6CCF70f8c9fB9CA5De916`
-**Explorer:** https://explorer-studio.genlayer.com/address/0x7c557cc043d7F8e338A6CCF70f8c9fB9CA5De916
+**Address:** `0x59bCA9075ea4B3ed8551D437103432C7f4d809F7`
+**Explorer:** https://explorer-studio.genlayer.com/address/0x59bCA9075ea4B3ed8551D437103432C7f4d809F7
 
 ## How It Works
 
@@ -17,24 +17,24 @@ P2P head-to-head sports betting contract on GenLayer. Two users challenge each o
 ## Security Features (GenLayer steward review)
 
 1. **Exact escrow before FUNDED:** a bet only enters `funded` when both exact stakes are actually escrowed. `create_bet` accounts for any value it receives (0 => fund later, exact stake => escrowed now, anything else => rejected); `accept_and_fund_bet` refuses to transition until the creator's stake is escrowed.
-2. **Event-finality gate:** resolution only reaches a terminal outcome when the event is FINAL. An unfinished or unclear event returns a retryable `not_final` status and can never trigger an immediate terminal draw refund.
+2. **Event-finality gate:** resolution only reaches a terminal outcome when the event is FINAL. `event_final` must be an actual JSON boolean - values like the string `"false"` (where `bool("false")` is True) are rejected before consensus and at settlement, so an unfinished or unclear event can never trigger an immediate terminal draw refund. It returns a retryable `not_final` status instead.
 3. **Deterministic timeout refund:** `timeout_refund()` is a fully deterministic path (no LLM / web / nondeterministic consensus) that refunds both parties once the resolution timeout expires.
 
 Additional hardening: caller restriction, anti double-fund, per-bet fund isolation, atomic state+transfer, validator binding on winner and finality, URL binding, cancel protection.
 
 ## Tests
 
-**Direct tests (71):**
+**Direct tests (85):**
 ```bash
 python -m pytest tests/direct/ -v
 ```
 
 **Integration tests (17) against the deployment:**
 ```bash
-STAKE_CLASH_ADDRESS=0x7c557cc043d7F8e338A6CCF70f8c9fB9CA5De916 python -m pytest tests/integration/
+STAKE_CLASH_ADDRESS=0x59bCA9075ea4B3ed8551D437103432C7f4d809F7 python -m pytest tests/integration/
 ```
 
 **Live tests (40) on GenLayer Studio:**
 ```bash
-python tools/live_test.py 0x7c557cc043d7F8e338A6CCF70f8c9fB9CA5De916
+python tools/live_test.py 0x59bCA9075ea4B3ed8551D437103432C7f4d809F7
 ```
