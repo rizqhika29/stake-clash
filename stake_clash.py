@@ -579,7 +579,15 @@ class StakeClash(gl.Contract):
         # Extract winner from consensus
         values = result["values"]
         winner_label = values.get("winner", "DRAW")
-        event_final = bool(values.get("event_final", False))
+        # STRICT: never coerce at settlement either. A non-boolean flag
+        # (e.g. the string "false") must be rejected outright -- bool("false")
+        # is True and would wrongly open the terminal draw refund.
+        raw_final = values.get("event_final")
+        if not isinstance(raw_final, bool):
+            raise gl.vm.UserError(
+                "invalid event_final flag (not a JSON boolean)"
+            )
+        event_final = raw_final
 
         # EVENT-FINALITY GATE: an unfinished or unclear event can never
         # reach a terminal draw refund. It either retries (before timeout)
@@ -735,7 +743,9 @@ CRITICAL - event finality:
 - When event_final is false, set winner to "DRAW" as a placeholder.
 
 You MUST also provide:
-- event_final: true or false (see above)
+- event_final: true or false (see above). It MUST be a JSON boolean literal
+  (true or false) - never a quoted string such as "true" or "false", never a
+  number, and never null. Anything else is rejected.
 - confidence: a number 0-100 indicating your confidence
 - reasoning: a brief explanation of your determination
 
@@ -752,7 +762,13 @@ Respond with ONLY a JSON object, no other text, no markdown fences:
         return {"ok": False, "reason": "invalid_llm_response"}
 
     winner = _normalize_verdict(payload.get("winner"))
-    event_final = bool(payload.get("event_final", False))
+    # STRICT: only an actual JSON boolean is accepted. bool("false") is True,
+    # so any coercion here would let a quoted string flip finality on and
+    # open the door to an immediate terminal draw refund.
+    raw_final = payload.get("event_final")
+    if not isinstance(raw_final, bool):
+        return {"ok": False, "reason": "event_final_not_boolean"}
+    event_final = raw_final
     confidence = payload.get("confidence", 0)
     reasoning = str(payload.get("reasoning", ""))[:500]
 
@@ -832,8 +848,9 @@ def _consensus_validator(
 def _consensus_ok(data) -> bool:
     """Deterministic shape check on the agreed consensus payload.
 
-    Requires the event_finality flag to be present (its value is a semantic
-    decision handled by resolve_bet, but the field must exist)."""
+    Requires event_final to be present AND to be an actual JSON boolean
+    (isinstance bool) -- strings such as "false" are rejected, so a coerced
+    value can never reach settlement."""
     payload = _parse_json_object(data)
     if payload is None:
         return False
